@@ -604,5 +604,3 @@ before trusting `--queues 2`.
 - `dns_cache_init()` zeroes the bucket table without freeing existing
   nodes, so calling it twice leaks. Only reachable in tests, which work
   around it with an explicit `fini()`.
-#   f i z z D N S  
- 
