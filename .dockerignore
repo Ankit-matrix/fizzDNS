@@ -1,0 +1,9 @@
+*.o
+af_xdp_user
+server
+af_xdp_user_stub
+server_stub
+test_dns
+af_xdp_kern.o
+.git
+.gitignore

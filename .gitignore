@@ -1,0 +1,22 @@
+# build artifacts
+*.o
+*.pyc
+__pycache__/
+
+# binaries
+af_xdp_user
+af_xdp_user_stub
+server
+server_stub
+test_dns
+test_dns_tsan
+bench_bloom
+bench_nobloom
+loadgen
+
+# sanitizer builds
+*_asan
+*_tsan
+
+# scratch dumps, not sources
+overall_code*.txt

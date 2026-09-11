@@ -1,0 +1,35 @@
+# Two-core parallel run. The split is the point:
+#
+#   KERNEL SIDE   one XDP program on the interface, RSS spreading
+#                 flows over 2 rx queues, NIC IRQ for each queue
+#                 pinned to its own core.
+#   USER SIDE     two AF_XDP sockets, one per queue, each with its own
+#                 UMEM/rings/frame pool and one pinned thread.
+#
+# cpuset, NOT cpus: `cpus: 2.0` is a CFS quota and throttles at every
+# 100ms period boundary, which shows up as latency spikes that look
+# like contention. cpuset is hard placement with no throttling.
+services:
+  resolver:
+    build: .
+    # CAP_BPF+CAP_NET_ADMIN is enough on >=5.8; privileged is the
+    # blunt instrument if your kernel or runtime disagrees.
+    cap_add: [BPF, NET_ADMIN, NET_RAW, SYS_ADMIN, PERFMON]
+    network_mode: host
+    ulimits:
+      memlock: -1
+    cpuset: "0,1"
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+    command: >
+      ./af_xdp_user -d ${IFACE:-eth0} --filename ./af_xdp_kern.o
+      --queues 2 -w ${WORKERS:-4}
+
+  # Control arm. Same cpuset, same core budget -- otherwise the
+  # comparison is between two machines, not two transports.
+  udp:
+    build: .
+    network_mode: host
+    cpuset: "0,1"
+    command: ./server -p 53 -w ${WORKERS:-4}
+    profiles: [control]
