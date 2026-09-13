@@ -1,0 +1,25 @@
+﻿how does DNS over UDP differ from AF_XDP vs AF_XDP zero-copy. how does each work
+first of all how does a kernel injection work with a user space thing - okay, it's in the virtual machine still, (there's an os on top of an os), but they specified that they are passing argment cpu = 0. now my understanding is that - of we have one instance of a resolver and we are blocking queries (so no pipelining queries, so no issues of concurrency). now how does docker, a user space application, decide which cpu is used 
+
+
+okay, so my teammates have made a rough implementation of the DNS resolver. they need to make sure it works by tomorrow. the rest of us have to make improvements and extensions. 
+
+
+leave that aside. it's not necessary to implement that exactly. so... what other extensions/improvements can be used here?
+how does that happen? where compile-time patch is achieved if there's no xdp program.
+In the DNS server case, if the XDP hook program (which
+we attach) identifies a packet destined for port 53, it calls:
+bpf_redirect_map(&xsks_map, rx_queue_index, 0);
+The XSKMAP holds kernel-space references to AF XDP
+socket objects (struct xdp sock *), indexed by NIC RX
+queue ID. The XDP program does not itself deliver the
+packet, copy memory, or interact with the socket directly. It
+only selects a target socket and returns XDP REDIRECT.
+okay. one second. let's trace this back. after the softirq marks that DMA descriptor as free, the XDP hook is called. the XDP hook is an eBPF program. now the eBPF program is called (how was the previous program - function pointer, making sure it's there via static something). now, if we have our redirect case. wait the xdp_md is metadata, which the prorgam can use to parse the data. okay, i'm also lost on how socket's in the general case are attached to the network stack. so, from the UMEM, what does the AF_XDP socket have to do with this. the XDP program only decides which socket to pass on the packet to. it doesn't do any packet processing by itself. okay. a socket is just a file. so, the kernel when it sees the returned value XDP_REDIRECT performs the redirect. how does zero-copy come in here? wait, the DMA into UMEM has already happened. now... the kernel whose responsibility it was to tell the app it has put data into a frame in the RX ring, pushes to the RX ring
+wait, but in the NIC RX ring, it's gon.e. yeah, that's not the issue. placing it on userspace TX rings is easy, since it's a queue. then, how does DMA remain, if descriptor isn't there in TX ring. like what is the reverse DMA mechanism.
+Throughout this process, the rings do not store packet contents or kernel metadata, but only UMEM buffer offsets, enabling a zero-copy data path. By delegating buffer lifecycle
+management to userspace while offloading data movement to
+DMA, AF XDP removes the need for sk buff allocations
+and avoids traversing the kernel networking stack, significantly reducing per-packet overhead while maintaining full
+control of packet processing in userspace.
+explain how AF_XDP's syscall triggered thing works. i didn't understand this. NAPI is when only the first packet triggers an interrupt and schedules a softirq to check the NIC's RX ring. the thing is, who sends the packets to the socket? anyways, i guess instead here, the userspace does it. what difference does it make, cause unless we specify a cpu for this userspace app, scheduling latency applies even then
