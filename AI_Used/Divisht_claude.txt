@@ -1,10 +1,122 @@
 
+dns_ax.zip
+dns_ax.zip
+ZIP
 project : Project Description: This project implements a DNS resolver that sends and receives DNS packets using an AF_XDP (XSK) socket instead of the usual UDP/TCP socket. An XDP program attached to the NIC redirects DNS traffic (UDP dst port 53) to an AF_XDP socket; a user-space resolver crafts raw Ethernet/IPv4/UDP/DNS frames, transmits them via the XSK TX ring, and receives responses on the XSK RX ring. The project demonstrates low-latency, high-throughput packet I/O, zero-copy packet handling tradeoffs, and the extra plumbing required (UMEM, rings, descriptor management) compared to conventional sockets. Tools / Technologies Linux kernel AF_XDP / XDP support (recent kernel) clang/llvm (for compiling the XDP BPF program) libbpf / libxsk (or equivalent XSK helper code) for user-space XSK setup C (user-space resolver) for packet crafting and XSK ring handling bpftool / xdp-loader (to load/attach the XDP program) tcpdump / Wireshark / pkt-gen (for validation and packet inspection) Expected Outcome: Comparison vs standard UDP sockets: measurements of latency, throughput, and CPU overhead showing AF_XDP tradeoffs (zero-copy performance benefits vs implementation complexity).
 
 we are done with most part , i want to add bloom filter additionally in this : Before hitting the hash map, use a Bloom filter (implementable as a BPF array with bit operations) to quickly determine "definitely not in cache" vs "maybe in cache". Saves map lookup overhead for cold queries. 
 
 also add some testing mechanism for this
 
+Ran 21 commands, created 4 files, shared files
+Two things I had to decide before writing anything, both of which change the answer:
+
+The brief says "BPF array", but the cache isn't in BPF. af_xdp_kern.c only classifies and redirects — it does no cache lookup, and there's no BPF map cache to guard. A filter there could only tell the kernel "this name isn't cached," and since a miss has to reach userspace to be resolved anyway, it would save nothing while adding a userspace→kernel sync problem. The map worth guarding is dns_cache.c's userspace hash table, so that's where I put it. (If you want the kernel-side version anyway for the report, BPF_MAP_TYPE_BLOOM_FILTER exists natively since 5.16 — say the word.)
+
+A plain Bloom filter is wrong for this cache. Your cache deletes: LRU eviction and TTL expiry both remove entries. A plain bit filter can't clear a bit without risking a false negative for some other key sharing it, so bits only accumulate, FPR climbs to 1, and the filter decays into a branch that always says "maybe" — it would pass a naive test suite and quietly stop working in production. I used a counting filter: 65536 one-byte counters (64 KiB), k=4, m/n=16 at your 4096-entry capacity → analytic FPR ≈ 0.24%. One byte per slot rather than packed nibbles so updates are atomic without a read-modify-write straddling two counters.
+
+The saving isn't the hash — it's the mutex. A cold query now answers with four relaxed byte loads and never takes the lock. Reads are lock-free; updates ride the existing cache mutex. Both race directions are benign (detailed in the comments), and it's clean under TSan.
+
+Measured, 4 threads, 2M lookups (single-CPU container, so contention is serialised and this understates the multi-core case):
+
+cold %	bloom Mlookup/s	no-bloom	ratio
+99	22.9	14.7	1.55×
+90	17.2	11.8	1.45×
+50	7.69	7.56	1.02×
+0	4.96	5.49	0.90×
+The last row is the honest finding and belongs in your report: on an all-hit workload the filter is pure overhead, ~10% slower. It pays only when miss rate is high. Measured FPR came out at 0.255% against the 0.24% analytic bound.
+
+Testing — three layers, all in make test (212 checks, 0 failures under ASan+UBSan):
+
+test_bloom() — no-false-negatives, counting semantics (add twice / delete once must still read present, the exact case a plain filter fails), full add-then-delete churn leaving zero slots set, and measured-vs-analytic FPR over 100k probes.
+test_bloom_cache_sync() — the one that matters: drives 3× capacity through the LRU and asserts reachable entries == live entries through the public cache API. A filter that's incremented but never decremented passes every isolated test and fails here.
+make bench — A/B sweep. bench_bloom and bench_nobloom from one source via -DDNS_BLOOM_DISABLED, compile-time not runtime so neither binary carries the other's branch. Names are pre-generated outside the timed loop; snprintf inside it was costing ~300 ns/op and burying the effect.
+dns_backend_fini() now also prints bloom lookups, reject rate, slots used, and a saturation warning if the filter is ever undersized.
+
+One thing I noticed but didn't touch: dns_cache_init() zeroes the bucket table without freeing existing nodes, so calling it twice leaks. Pre-existing, and my test works around it with an explicit fini().
+
+
+Bloom filter
+PATCH 
+
+Dns bloom
+H 
+
+Dns bloom
+C 
+
+Bench bloom
+C 
+make sure there's much overhead (like bloom filter usually doesn't) and ensure that caching is done alright
+
+Tracing contention from shared atomic counters on every lookup.
+Fair challenge — a Bloom check should cost a handful of nanoseconds, not 10%. Let me find where that went.
+
+Ran 3 commands
+The atomic counters are the bug — a lock xadd on a shared line on every lookup. Fixing with per-thread shards (relaxed load/store is a plain mov on x86; only the RMW takes the lock prefix):
+
+Ran a command
++53 ns → +9 ns. The remaining cost is 4 scattered loads across 64 KiB (up to 4 cache lines). Testing whether confining them to one cache line helps:
+
+Ran a command
+Blocked is worse — the dedupe costs more than the cache misses it saves, since 64 KiB mostly sits in L2. Keeping the scattered layout. Now the full re-measure plus a correctness check:
+
+Ran 2 commands
+Residual overhead on a hit is ~4 ns (within run-to-run noise); the cold path is now 1.84× single-threaded. The earlier 0.90× regression was entirely the atomic counters.
+
+Now on "caching is done alright" — the lock-free read is the risky part, so let me test it under concurrency:
+
+Ran a command
+The concurrent test has a bug — seed & 1 picks put vs get and seed % CT_KEYS picks the key, so puts only ever touched odd keys and gets only even ones. 0% hit rate is the tell:
+
+Ran 2 commands, shared files
+You were right to push. There was real overhead and it was my fault.
+
+The bug. I instrumented the filter with three shared _Atomic counters and fetch_add'ed them on every lookup. That's a lock-prefixed read-modify-write on a cache line every worker writes — the exact shared-write cost the filter exists to avoid, reintroduced by its own bookkeeping. Isolated microbenchmark:
+
+scattered + atomic counters    14.58 ns
+scattered, no counters          4.90 ns
+~10 ns per lookup uncontended, much worse with four threads. Fixed by sharding stats one cache line per thread. Each thread is the sole writer to its shard, so the relaxed load/store pair compiles to plain mov with no lock prefix; readers sum the shards.
+
+I also tried a blocked layout (all k slots inside one cache line, 1 miss instead of 4). It measured worse — 41.6 vs 34.2 ns on the cold path — because the dedupe needed for add/del symmetry costs more than the misses it saves, 64 KiB largely sitting in L2. Discarded it rather than keep a plausible-sounding optimisation that doesn't pay.
+
+Overhead now, 5 repeats, single thread, 3M lookups each (ns/op):
+
+all-hit    bloom    180.3  176.3  177.2  180.3  198.9
+all-hit    nobloom  182.9  175.8  169.1  189.0  174.9
+all-cold   bloom     34.7   35.5   35.8   36.0   36.9
+all-cold   nobloom   64.6   64.4   64.0   67.2   63.5
+On the hit path the two are indistinguishable — the difference is ~4 ns against run-to-run spread of 169–199. The earlier 0.90× regression is gone entirely; it was the counters, not the filter. Cold path is 1.84×.
+
+Caching correctness. Three checks, all passing:
+
+Differential — same seeded query sequence through both binaries, hit counts identical at every mix:
+
+cold %	100	99	90	50	10	0
+bloom hits	0.0%	1.0%	10.4%	50.3%	90.0%	100.0%
+nobloom hits	0.0%	1.0%	10.4%	50.3%	90.0%	100.0%
+Zero lost hits. That's the property that matters: the filter must never cost you a cached answer.
+
+Concurrent — new test_cache_concurrent(), 4 threads interleaving puts and gets over a shared key space, so adds, deletes and lock-free reads genuinely overlap. Asserts each hit returns the value its key was stored with (catches cross-key corruption), and after quiescing, reachable == live. 76% hit rate, 994 live, invariant holds.
+
+TSan — make test-race builds the suite with -fsanitize=thread. Clean, 213 checks, 0 failures. Separate target because TSan and ASan can't be combined.
+
+One thing worth flagging: my first version of the concurrent test reported a 0.0% hit rate. The key was seed % CT_KEYS and the put/get branch was seed & 1, so puts only ever landed on odd keys and gets only read even ones. It would have passed as a green test that exercised nothing. Fixed to take the key from bits the branch doesn't use, and the comment explaining it is in the source so it doesn't get reintroduced.
+
+Still outstanding from before: dns_cache_init() zeroes the bucket table without freeing nodes, so calling it twice leaks. Pre-existing; I work around it in tests with an explicit fini() rather than changing it.
+
+
+Bloom filter
+PATCH 
+
+Dns bloom
+C 
+
+Dns bloom
+H 
+
+Bench bloom
+C 
 Planning a dense five-slide deck with real evaluation data.
 Real numbers now — and the headline changed. The contention hypothesis I flagged as untested is confirmed: 1.38× → 3.79× monotonically with thread count. That becomes the centrepiece.
 
@@ -77,9 +189,5 @@ Part 5 is the highest-value section. A weakness you raise yourself is evidence o
 The one rule, stated at the top: never invent a number. One fabricated figure makes an examiner doubt every real one you have — and you have a lot of real ones.
 
 Two things worth cross-checking in your PDF before submission, which I flagged last turn and are still in the uploaded version: "Table ??" in §5.4 and "[?]" in §8 are unresolved LaTeX references.
-
-
-Viva prep
-Document·MD 
 
 
